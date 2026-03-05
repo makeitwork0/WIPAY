@@ -1,0 +1,478 @@
+# 🛠️ WiPay Setup Guide
+
+Complete step-by-step instructions for deploying WiPay on a Raspberry Pi.
+
+---
+
+## Table of Contents
+
+1. [Hardware Requirements](#1-hardware-requirements)
+2. [Operating System Setup](#2-operating-system-setup)
+3. [Network Interface Configuration](#3-network-interface-configuration)
+4. [Installing Dependencies](#4-installing-dependencies)
+5. [Configuring the Project Files](#5-configuring-the-project-files)
+6. [Firewall Setup](#6-firewall-setup)
+7. [Database Initialization](#7-database-initialization)
+8. [Launching the Application](#8-launching-the-application)
+9. [Remote Admin Setup (Cloudflare Tunnel)](#9-remote-admin-setup-cloudflare-tunnel)
+10. [Running as a System Service](#10-running-as-a-system-service)
+11. [First-Time Admin Access](#11-first-time-admin-access)
+12. [Troubleshooting](#12-troubleshooting)
+
+---
+
+## 1. Hardware Requirements
+
+| Item | Requirement |
+|---|---|
+| **Device** | Raspberry Pi 3B+ or newer (Pi 4 / Pi 5 recommended for performance) |
+| **Storage** | MicroSD card — 8 GB minimum, 16 GB+ recommended |
+| **Network Interfaces** | **Two** interfaces required — one for the hotspot, one for uplink internet |
+| **Uplink** | Any of: Ethernet (`eth0`), second USB WiFi adapter, or 4G/LTE dongle |
+| **Hotspot Interface** | Built-in WiFi (`wlan0`) or a dedicated USB WiFi adapter |
+| **Power** | Official Raspberry Pi power supply (5V/3A for Pi 4+) |
+
+> **Tip:** The most common configuration is `wlan0` as the managed hotspot and `eth0` as the wired internet uplink. Adjust interface names throughout this guide to match your setup.
+
+---
+
+## 2. Operating System Setup
+
+### Flash Raspberry Pi OS
+
+1. Download **Raspberry Pi OS Lite** (64-bit recommended) from [raspberrypi.com/software](https://www.raspberrypi.com/software/).
+2. Flash it to your MicroSD card using **Raspberry Pi Imager** or **Balena Etcher**.
+3. Before writing, use the Imager's **Advanced Settings** (⚙️) to:
+   - Set hostname (e.g., `wipay`)
+   - Enable SSH
+   - Set your WiFi credentials for initial setup (you can remove this later)
+   - Set a username and password
+
+### First Boot
+
+```bash
+# SSH into your Pi
+ssh pi@wipay.local
+
+# Update the system
+sudo apt update && sudo apt upgrade -y
+```
+
+---
+
+## 3. Network Interface Configuration
+
+WiPay needs `hostapd` and `dnsmasq` to create and manage the WiFi hotspot network.
+
+### Install Access Point Tools
+
+```bash
+sudo apt install -y hostapd dnsmasq
+```
+
+### Configure the Hotspot Interface (Static IP)
+
+Edit the DHCP client configuration to give `wlan0` a static IP:
+
+```bash
+sudo nano /etc/dhcpcd.conf
+```
+
+Add to the end of the file:
+
+```
+interface wlan0
+  static ip_address=192.168.50.1/24
+  nohook wpa_supplicant
+```
+
+### Configure hostapd (Access Point)
+
+```bash
+sudo nano /etc/hostapd/hostapd.conf
+```
+
+```ini
+interface=wlan0
+driver=nl80211
+ssid=WiPay-Hotspot
+hw_mode=g
+channel=6
+wmm_enabled=0
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+```
+
+Enable hostapd:
+
+```bash
+sudo systemctl unmask hostapd
+sudo systemctl enable hostapd
+```
+
+### Configure dnsmasq (DHCP + DNS for Clients)
+
+Back up the default config and create a new one:
+
+```bash
+sudo mv /etc/dnsmasq.conf /etc/dnsmasq.conf.bak
+sudo nano /etc/dnsmasq.conf
+```
+
+```ini
+interface=wlan0
+dhcp-range=192.168.50.10,192.168.50.250,255.255.255.0,24h
+domain=local
+address=/#/192.168.50.1
+```
+
+> The `address=/#/192.168.50.1` line makes **all DNS queries** resolve to the Pi's IP — this is what triggers the captive portal popup on most devices.
+
+Restart networking services:
+
+```bash
+sudo systemctl restart dhcpcd
+sudo systemctl restart dnsmasq
+```
+
+---
+
+## 4. Installing Dependencies
+
+### System Packages
+
+```bash
+sudo apt install -y \
+  python3-flask \
+  python3-psutil \
+  sqlite3 \
+  iptables \
+  qrencode \
+  cloudflared \
+  curl
+```
+
+> **Note:** If `cloudflared` is not available via `apt`, install it manually:
+> ```bash
+> curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb -o cloudflared.deb
+> sudo dpkg -i cloudflared.deb
+> ```
+
+### Python Packages
+
+```bash
+pip3 install qrcode[pil] psutil --break-system-packages
+```
+
+---
+
+## 5. Configuring the Project Files
+
+### Clone the Repository
+
+```bash
+cd /opt
+sudo git clone https://github.com/makeitwork0/WIPAY.git captive-portal
+sudo chown -R $USER:$USER /opt/captive-portal
+cd /opt/captive-portal/Project-files
+```
+
+### Configure `tunnel_mailer.py` (for Remote Access)
+
+Open the file and update the configuration block at the top:
+
+```bash
+nano tunnel_mailer.py
+```
+
+```python
+# --- CONFIGURATION ---
+EMAIL_SENDER   = "your_gmail@gmail.com"
+EMAIL_PASSWORD = "your_app_password"    # Gmail App Password — NOT your login password
+EMAIL_RECEIVER = "your_gmail@gmail.com" # Where to receive the tunnel URL
+PORTAL_PORT    = "8081"                 # Must match the port app4.py runs on
+```
+
+> **How to create a Gmail App Password:**
+> 1. Go to [myaccount.google.com/security](https://myaccount.google.com/security)
+> 2. Enable **2-Step Verification** if not already on
+> 3. Go to **App Passwords** → Create a new one → Copy the 16-character password
+> 4. Paste it (without spaces) as `EMAIL_PASSWORD`
+
+### Verify `setup_firewall.sh` Interface Names
+
+```bash
+nano setup_firewall.sh
+```
+
+Check that these match your actual interface names:
+
+```bash
+HOTSPOT_IF="wlan0"    # The interface clients connect to
+INTERNET_IF="eth0"    # The interface with internet access
+PORTAL_PORT="8080"
+GATEWAY_IP="192.168.50.1"
+```
+
+Run `ip link show` to list your interfaces and confirm the names.
+
+---
+
+## 6. Firewall Setup
+
+Make the firewall script executable and run it:
+
+```bash
+chmod +x setup_firewall.sh
+sudo ./setup_firewall.sh
+```
+
+You should see:
+
+```
+Setting up Captive Portal Firewall...
+Firewall setup complete!
+```
+
+### What this script does:
+
+- Enables IPv4 packet forwarding (`/proc/sys/net/ipv4/ip_forward = 1`)
+- Flushes existing iptables rules to start clean
+- Sets up NAT masquerading so clients share the Pi's internet connection
+- Creates a `CAPTIVE_PORTAL` iptables chain that redirects all HTTP (port 80) traffic to Flask on port 8080
+- Configures a `FORWARD` chain that blocks all traffic by default — Flask grants access per-device dynamically
+- Creates a `tc` HTB bandwidth tree on the hotspot interface for per-user speed limiting
+
+### Make Firewall Rules Persistent
+
+Install `iptables-persistent` to restore rules on reboot:
+
+```bash
+sudo apt install iptables-persistent -y
+# When prompted, choose YES to save current rules
+```
+
+To save rules manually at any time:
+
+```bash
+sudo netfilter-persistent save
+```
+
+---
+
+## 7. Database Initialization
+
+The SQLite database is created automatically when the app first starts. The default path is:
+
+```
+/opt/captive-portal/portal.db
+```
+
+The app will create all tables and seed default settings on the first run. No manual database setup is required.
+
+---
+
+## 8. Launching the Application
+
+### Set the Admin Secret
+
+The app **will not start** without the `ADMIN_SECRET` environment variable. Choose a strong, random password:
+
+```bash
+export ADMIN_SECRET="replace_this_with_a_strong_password"
+```
+
+### Run the Flask App
+
+```bash
+cd /opt/captive-portal/Project-files
+sudo -E python3 app4.py
+```
+
+> `sudo` is required because the app uses `iptables` and `tc` system commands to control traffic.  
+> `-E` preserves your environment variables (including `ADMIN_SECRET`) when escalating to root.
+
+### Verify It's Running
+
+From another device connected to your hotspot, open any HTTP URL — you should be redirected to the WiPay portal page.
+
+From the Pi itself:
+
+```bash
+curl http://192.168.50.1:8080
+```
+
+---
+
+## 9. Remote Admin Setup (Cloudflare Tunnel)
+
+To access the admin panel from anywhere without port forwarding:
+
+```bash
+cd /opt/captive-portal/Project-files
+python3 tunnel_mailer.py &
+```
+
+The script will:
+1. Start `cloudflared` and point it at `http://127.0.0.1:<PORTAL_PORT>`
+2. Parse the output for the `trycloudflare.com` URL
+3. Send you an email with a direct link to `/admin`
+
+If the tunnel crashes or disconnects, the script automatically restarts it after 10 seconds.
+
+---
+
+## 10. Running as a System Service
+
+Set up WiPay to start automatically on boot using `systemd`.
+
+### Create the Flask App Service
+
+```bash
+sudo nano /etc/systemd/system/wipay.service
+```
+
+```ini
+[Unit]
+Description=WiPay Captive Portal
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/captive-portal/Project-files
+Environment="ADMIN_SECRET=replace_this_with_a_strong_password"
+ExecStart=/usr/bin/python3 /opt/captive-portal/Project-files/app4.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Create the Tunnel Mailer Service (Optional)
+
+```bash
+sudo nano /etc/systemd/system/wipay-tunnel.service
+```
+
+```ini
+[Unit]
+Description=WiPay Cloudflare Tunnel Mailer
+After=wipay.service
+Requires=wipay.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/captive-portal/Project-files
+ExecStart=/usr/bin/python3 /opt/captive-portal/Project-files/tunnel_mailer.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Enable and Start Services
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable wipay.service
+sudo systemctl enable wipay-tunnel.service
+sudo systemctl start wipay.service
+sudo systemctl start wipay-tunnel.service
+```
+
+### Check Service Status
+
+```bash
+sudo systemctl status wipay.service
+sudo journalctl -u wipay.service -f    # Live logs
+```
+
+---
+
+## 11. First-Time Admin Access
+
+### Local Access
+
+```
+http://192.168.50.1:8080/admin
+```
+
+### Remote Access (via Cloudflare Tunnel)
+
+Check your email for the link — it will look like:
+
+```
+https://random-words.trycloudflare.com/admin
+```
+
+### Logging In
+
+Enter the `ADMIN_SECRET` value you set in your service file or environment.
+
+### Recommended First Steps
+
+1. **Set portal branding** — Go to **Settings** and update the portal title and subtitle.
+2. **Configure pricing plans** — Edit the data rate plans (name, duration, speed, price label) to match your offerings.
+3. **Generate test vouchers** — Go to **Vouchers → Generate** and create a few codes to verify the full flow.
+4. **Test user flow** — Connect a phone to the hotspot, browse to any site, and confirm you land on the portal. Enter a voucher and verify internet access is granted.
+
+---
+
+## 12. Troubleshooting
+
+### Portal page not showing on client devices
+
+- Confirm `dnsmasq` is running: `sudo systemctl status dnsmasq`
+- Confirm `hostapd` is running: `sudo systemctl status hostapd`
+- Check that `wlan0` has the static IP: `ip addr show wlan0`
+- Confirm iptables redirect is in place: `sudo iptables -t nat -L -n -v`
+
+### App fails to start — "ADMIN_SECRET not set"
+
+The environment variable must be set before running. For systemd services, it must be in the `Environment=` line. Do **not** wrap the value in quotes inside the service file.
+
+### `sudo` commands hang or time out inside the app
+
+Ensure the `pi` (or running) user has passwordless sudo for `iptables` and `tc`:
+
+```bash
+sudo visudo
+```
+
+Add at the bottom:
+
+```
+pi ALL=(ALL) NOPASSWD: /sbin/iptables, /sbin/tc
+```
+
+### Clients can't reach the internet after voucher entry
+
+- Check IPv4 forwarding: `cat /proc/sys/net/ipv4/ip_forward` — should print `1`
+- Verify the NAT rule: `sudo iptables -t nat -L POSTROUTING -n -v`
+- Ensure `INTERNET_IF` in `setup_firewall.sh` is correct for your uplink interface
+
+### Cloudflare tunnel not starting
+
+- Verify `cloudflared` is installed: `cloudflared --version`
+- Check the tunnel mailer logs: `sudo journalctl -u wipay-tunnel.service -f`
+- Ensure the Pi has outbound internet access on the uplink interface
+
+### Database errors or missing tables
+
+Delete `portal.db` and restart the app — it will recreate the database with all tables and default settings:
+
+```bash
+rm /opt/captive-portal/portal.db
+sudo systemctl restart wipay.service
+```
+
+---
+
+## 📞 Support
+
+For issues and questions, open an issue on the [GitHub repository](https://github.com/makeitwork0/WIPAY).
